@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""owui-admin — admin CLI for the Open WebUI instance on this host.
+
+Talks to the app over its own HTTP API rather than the SQLite file, so it goes
+through the same validation and permission filtering the admin UI does, and it
+keeps working if the database is being written to.
+
+Defaults to the loopback upstream (127.0.0.1:[REDACTED:loopback-port]) so it still works when
+nginx or TLS is broken. Use --url to point somewhere else.
+
+Credentials come from OWUI_ADMIN_EMAIL / OWUI_ADMIN_PASSWORD, or are read out
+of admin-credentials.txt next to this script, or can be prompted for. The JWT
+is cached in /tmp so you are not asked on every invocation.
+
+Commands
+  password <email> <newpass>              set any user's password (this is how
+                                          you recover a forgotten one)
+  users list                              list users
+  users add <email> <name> <pass>         create a user  [--role user]
+  users role <email> <role>               change role      (pending|user|admin)
+  users rm <email>                        delete a user
+  groups list                             list groups
+  groups create <name>                    create a group
+  groups add <group> <email>...           add members
+  groups rm <group> <email>...            remove members
+  groups delete <group>                   delete a group
+  models                                  list models and who can use each
+  grants show <model>                     show one model's grants
+  grants set <model> <principal>...       grant access
+  grants clear <model>                    revoke all access to a model
+
+  <principal> is  @everyone | @user:<email|id> | @group:<name|id>
+  Add --write to grant write (edit) instead of read (use).
+"""
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_URL = "http://127.0.0.1:[REDACTED:loopback-port]"
+TOKEN_CACHE = "/tmp/owui-admin.token"
+CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "admin-credentials.txt")
+
+# principal_type -> the "anyone" wildcard used in the access_grant table
+WILDCARD = "*"
+
+
+class ApiError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- transport
+
+
+class Client:
+    def __init__(self, base, token=None):
+        self.base = base.rstrip("/")
+        self.token = token
+
+    def call(self, method, path, body=None, query=None, auth=True):
+        url = self.base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"}
+        if auth and self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:400]
+            raise ApiError(f"{method} {path} -> HTTP {e.code}: {detail}")
+        except urllib.error.URLError as e:
+            raise ApiError(f"{method} {path} -> {e.reason}\n"
+                           f"Is aichat running?  systemctl status aichat")
+
+    def signin(self, email, password):
+        out = self.call("POST", "/api/v1/auths/signin",
+                        {"email": email, "password": password}, auth=False)
+        if not out or not out.get("token"):
+            raise ApiError(f"signin refused for {email} (wrong password?)")
+        return out["token"]
+
+
+def load_token(client):
+    """A cached JWT is fine until it expires; fall back to signing in."""
+    try:
+        with open(TOKEN_CACHE) as fh:
+            tok = fh.read().strip()
+        if tok:
+            client.token = tok
+            client.call("GET", "/api/v1/auths/")  # validate
+            return
+    except (OSError, ApiError):
+        pass
+    client.token = None
+
+    email = os.environ.get("OWUI_ADMIN_EMAIL")
+    password = os.environ.get("OWUI_ADMIN_PASSWORD")
+    if not (email and password):
+        email, password = read_creds_file() or (None, None)
+    if not email:
+        email = input("admin email: ").strip()
+    if not password:
+        password = getpass.getpass(f"password for {email}: ")
+
+    client.token = client.signin(email, password)
+    try:
+        with open(TOKEN_CACHE, "w") as fh:
+            fh.write(client.token)
+        os.chmod(TOKEN_CACHE, 0o600)
+    except OSError:
+        pass
+
+
+def read_creds_file():
+    """Pull email/password out of the key=value admin-credentials.txt."""
+    try:
+        with open(CREDS_FILE) as fh:
+            vals = {}
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or " " not in line:
+                    continue
+                k, _, v = line.partition(" ")
+                vals[k.strip()] = v.strip()
+            return vals.get("email"), vals.get("password")
+    except OSError:
+        return None, None
+
+
+# ------------------------------------------------------------------ lookup
+
+
+def user_index(client):
+    """email -> user dict, plus the raw list for id lookups."""
+    out = client.call("GET", "/api/v1/users/all")
+    users = out.get("users", out) if isinstance(out, dict) else out
+    by_email = {u["email"]: u for u in users}
+    by_id = {u["id"]: u for u in users}
+    return users, by_email, by_id
+
+
+def resolve_user(users_by_email, users_by_id, ref):
+    """Accept an email address or a raw id."""
+    if ref in users_by_email:
+        return users_by_email[ref]
+    if ref in users_by_id:
+        return users_by_id[ref]
+    # Allow a unique prefix / local-part match, which is how people type these.
+    hits = [u for u in users_by_email.values() if u["email"].startswith(ref)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise ApiError(f"'{ref}' matches {len(hits)} users; use the full email")
+    raise ApiError(f"no such user: {ref}")
+
+
+def group_index(client):
+    out = client.call("GET", "/api/v1/groups/")
+    groups = out.get("groups", out) if isinstance(out, dict) else out
+    by_name = {g["name"]: g for g in groups}
+    by_id = {g["id"]: g for g in groups}
+    return groups, by_name, by_id
+
+
+def resolve_group(groups_by_name, groups_by_id, ref):
+    if ref in groups_by_name:
+        return groups_by_name[ref]
+    if ref in groups_by_id:
+        return groups_by_id[ref]
+    hits = [g for g in groups_by_name.values() if g["name"].startswith(ref)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise ApiError(f"'{ref}' matches {len(hits)} groups; use the full name")
+    raise ApiError(f"no such group: {ref}  (create it with: groups create {ref})")
+
+
+def all_models(client):
+    """Every model the instance knows about.
+
+    /api/v1/models/list only returns rows with a base_model_id set (see
+    routers/models.py:357), so it misses plain base models. /api/v1/models/base
+    is admin-only and returns exactly those. Merge both so nothing is hidden.
+    """
+    found = {}
+
+    base = client.call("GET", "/api/v1/models/base")
+    for m in base or []:
+        found[m["id"]] = dict(m, _src="base")
+
+    listed = client.call("GET", "/api/v1/models/list")
+    for m in (listed or {}).get("items", []):
+        found.setdefault(m["id"], dict(m, _src="preset"))
+        if m["id"] in found:
+            found[m["id"]].update({k: v for k, v in m.items() if v is not None})
+
+    return list(found.values())
+
+
+def model_detail(client, model_id):
+    return client.call("GET", "/api/v1/models/model", query={"id": model_id})
+
+
+def describe_grants(grants, users_by_id, groups_by_id):
+    """Render access_grant rows as readable principals."""
+    out = []
+    for g in grants or []:
+        ptype, pid, perm = g["principal_type"], g["principal_id"], g["permission"]
+        if pid == WILDCARD:
+            who = "everyone"
+        elif ptype == "user":
+            u = users_by_id.get(pid)
+            who = u["email"] if u else f"user:{pid}"
+        elif ptype == "group":
+            grp = groups_by_id.get(pid)
+            who = f"group:{grp['name']}" if grp else f"group:{pid}"
+        else:
+            who = f"{ptype}:{pid}"
+        out.append((who, perm))
+    return out
+
+
+# ----------------------------------------------------------------- output
+
+
+def print_models(client, users_by_id, groups_by_id):
+    models = all_models(client)
+    if not models:
+        print("no models known to the instance")
+        return
+    print(f"{'MODEL':<20} {'ACTIVE':<7} {'TYPE':<7} ACCESS")
+    print("-" * 78)
+    for m in sorted(models, key=lambda x: x["id"]):
+        grants = m.get("access_grants")
+        if grants is None:
+            grants = (model_detail(client, m["id"]) or {}).get("access_grants", [])
+        who = describe_grants(grants, users_by_id, groups_by_id)
+        access = ", ".join(f"{w} ({p})" for w, p in who) or "admin only (no grants)"
+        print(f"{m['id']:<20} {str(bool(m.get('is_active'))):<7} "
+              f"{m.get('_src',''):<7} {access}")
+
+
+def build_grant(arg, users_by_email, users_by_id, groups_by_name, groups_by_id,
+                permission):
+    """Turn '@user:bob@x.com' into an access_grant row."""
+    if arg == "@everyone":
+        return {"principal_type": "user", "principal_id": WILDCARD,
+                "permission": permission}
+    if arg.startswith("@user:"):
+        ref = arg[len("@user:"):]
+        u = resolve_user(users_by_email, users_by_id, ref)
+        return {"principal_type": "user", "principal_id": u["id"],
+                "permission": permission}
+    if arg.startswith("@group:"):
+        ref = arg[len("@group:"):]
+        g = resolve_group(groups_by_name, groups_by_id, ref)
+        return {"principal_type": "group", "principal_id": g["id"],
+                "permission": permission}
+    raise ApiError(f"cannot parse principal '{arg}'\n"
+                   "  use @everyone, @user:<email>, or @group:<name>")
+
+
+def set_grants(client, model_id, args, permission):
+    users, uby_email, uby_id = user_index(client)
+    _, gby_name, gby_id = group_index(client)
+
+    # Start from what is already there so `set` is additive unless you clear.
+    detail = model_detail(client, model_id)
+    if not detail:
+        raise ApiError(f"no such model: {model_id}")
+    current = [dict(g) for g in (detail.get("access_grants") or [])]
+    before = len(current)
+
+    for arg in args:
+        row = build_grant(arg, uby_email, uby_id, gby_name, gby_id, permission)
+        current = [g for g in current
+                   if not (g["principal_type"] == row["principal_type"]
+                           and g["principal_id"] == row["principal_id"]
+                           and g["permission"] == row["permission"])]
+        current.append(row)
+
+    client.call("POST", "/api/v1/models/model/access/update",
+                {"id": model_id, "name": detail.get("name"),
+                 "access_grants": current})
+    print(f"{model_id}: {before} -> {len(current)} grant(s)  "
+          f"({permission} for {', '.join(args)})")
+
+
+# --------------------------------------------------------------- commands
+
+
+def cmd_password(client, args):
+    _, uby_email, uby_id = user_index(client)
+    u = resolve_user(uby_email, uby_id, args.email)
+    client.call("POST", f"/api/v1/users/{u['id']}/update",
+                {"role": u["role"], "name": u["name"], "email": u["email"],
+                 "password": args.new_password})
+    print(f"password updated for {u['email']}")
+
+
+def cmd_users(client, args):
+    users, uby_email, uby_id = user_index(client)
+    if args.action == "list":
+        print(f"{'EMAIL':<34} {'ROLE':<9} {'ACTIVE':<7} NAME")
+        print("-" * 78)
+        for u in users:
+            print(f"{u['email']:<34} {u['role']:<9} "
+                  f"{str(bool(u.get('is_active'))):<7} {u.get('name') or ''}")
+        print(f"\n{len(users)} user(s)")
+        return
+
+    if args.action == "add":
+        body = {"name": args.name, "email": args.email,
+                "password": args.password, "role": args.role}
+        out = client.call("POST", "/api/v1/auths/add", body)
+        print(f"created {out.get('email')} as {out.get('role')} "
+              f"(id {out.get('id')})")
+        return
+
+    if args.action == "role":
+        u = resolve_user(uby_email, uby_id, args.email)
+        client.call("POST", f"/api/v1/users/{u['id']}/update", {"role": args.role})
+        print(f"{u['email']}: {u['role']} -> {args.role}")
+        return
+
+    if args.action == "rm":
+        u = resolve_user(uby_email, uby_id, args.email)
+        client.call("DELETE", f"/api/v1/users/{u['id']}")
+        print(f"deleted {u['email']} (id {u['id']})")
+
+
+def cmd_groups(client, args):
+    groups, gby_name, gby_id = group_index(client)
+    if args.action == "list":
+        if not groups:
+            print("no groups defined")
+        for g in groups:
+            print(f"{g['id']}  {g['name']}  ({g.get('description') or ''})")
+        return
+
+    if args.action == "create":
+        # GroupForm requires description; the CLI defaults it to the name so
+        # `groups create free-tier` works without inventing a sentence.
+        out = client.call("POST", "/api/v1/groups/create",
+                          {"name": args.name,
+                           "description": args.description or args.name})
+        print(f"created group {out.get('name')} (id {out.get('id')})")
+        return
+
+    if args.action == "delete":
+        g = resolve_group(gby_name, gby_id, args.group)
+        if not args.yes:
+            answer = input(f"delete group {g['name']}? [y/N] ").strip().lower()
+            if answer != "y":
+                print("aborted")
+                return
+        client.call("DELETE", f"/api/v1/groups/id/{g['id']}/delete")
+        print(f"deleted group {g['name']} (id {g['id']})")
+        return
+
+    g = resolve_group(gby_name, gby_id, args.group)
+    users, uby_email, uby_id = user_index(client)
+    ids = [resolve_user(uby_email, uby_id, e)["id"] for e in args.emails]
+
+    if args.action == "add":
+        client.call("POST", f"/api/v1/groups/id/{g['id']}/users/add",
+                    {"user_ids": ids})
+        print(f"added {len(ids)} user(s) to {g['name']}")
+    else:
+        client.call("POST", f"/api/v1/groups/id/{g['id']}/users/remove",
+                    {"user_ids": ids})
+        print(f"removed {len(ids)} user(s) from {g['name']}")
+
+
+def cmd_models(client, args):
+    _, _, users_by_id = user_index(client)
+    _, _, groups_by_id = group_index(client)
+    print_models(client, users_by_id, groups_by_id)
+
+
+def cmd_grants(client, args):
+    users, uby_email, uby_id = user_index(client)
+    _, gby_name, gby_id = group_index(client)
+
+    if args.action == "show":
+        detail = model_detail(client, args.model)
+        if not detail:
+            raise ApiError(f"no such model: {args.model}")
+        who = describe_grants(detail.get("access_grants"), uby_id, gby_id)
+        print(f"{detail.get('name')}  ({args.model})  active="
+              f"{bool(detail.get('is_active'))}")
+        if not who:
+            print("  no grants — admin only")
+        for w, p in who:
+            print(f"  {p:6s} {w}")
+        return
+
+    if args.action == "set":
+        set_grants(client, args.model, args.principals,
+                   "write" if args.write else "read")
+        return
+
+    detail = model_detail(client, args.model)
+    if not detail:
+        raise ApiError(f"no such model: {args.model}")
+    if not args.yes:
+        answer = input(f"revoke ALL access to {args.model}? [y/N] ").strip().lower()
+        if answer != "y":
+            print("aborted")
+            return
+    client.call("POST", "/api/v1/models/model/access/update",
+                {"id": args.model, "name": detail.get("name"),
+                 "access_grants": []})
+    print(f"{args.model}: all grants revoked (admin only again)")
+
+
+# ------------------------------------------------------------------- main
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="owui-admin", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--url", default=os.environ.get("OWUI_URL", DEFAULT_URL),
+                   help=f"Open WebUI base URL (default {DEFAULT_URL})")
+    sub = p.add_subparsers(dest="group", required=True)
+
+    sp = sub.add_parser("password", help="set a user's password")
+    sp.add_argument("email")
+    sp.add_argument("new_password")
+    sp.set_defaults(fn=cmd_password)
+
+    su = sub.add_parser("users", help="user management").add_subparsers(
+        dest="action", required=True)
+    s_list = su.add_parser("list", help="list users")
+    s_add = su.add_parser("add", help="create a user")
+    s_add.add_argument("email")
+    s_add.add_argument("name")
+    s_add.add_argument("password")
+    s_add.add_argument("--role", default="user",
+                       choices=["pending", "user", "admin"])
+    s_role = su.add_parser("role", help="change a user's role")
+    s_role.add_argument("email")
+    s_role.add_argument("role", choices=["pending", "user", "admin"])
+    s_rm = su.add_parser("rm", help="delete a user")
+    s_rm.add_argument("email")
+    for sp_ in (s_list, s_add, s_role, s_rm):
+        sp_.set_defaults(fn=cmd_users)
+
+    sg = sub.add_parser("groups", help="group management").add_subparsers(
+        dest="action", required=True)
+    g_list = sg.add_parser("list", help="list groups")
+    g_new = sg.add_parser("create", help="create a group")
+    g_new.add_argument("name")
+    g_new.add_argument("--description", help="defaults to the group name")
+    g_add = sg.add_parser("add", help="add members to a group")
+    g_add.add_argument("group")
+    g_add.add_argument("emails", nargs="+")
+    g_rm = sg.add_parser("rm", help="remove members from a group")
+    g_rm.add_argument("group")
+    g_rm.add_argument("emails", nargs="+")
+    g_del = sg.add_parser("delete", help="delete a group")
+    g_del.add_argument("group")
+    g_del.add_argument("--yes", action="store_true", help="skip the prompt")
+    for sp_ in (g_list, g_new, g_add, g_rm, g_del):
+        sp_.set_defaults(fn=cmd_groups)
+
+    sm = sub.add_parser("models", help="list models and their access")
+    sm.set_defaults(fn=cmd_models)
+
+    sgr2 = sub.add_parser("grants", help="manage model access").add_subparsers(
+        dest="action", required=True)
+    gsh = sgr2.add_parser("show", help="show a model's grants")
+    gsh.add_argument("model")
+    gset = sgr2.add_parser("set", help="grant access to a model")
+    gset.add_argument("model")
+    gset.add_argument("principals", nargs="+",
+                      help="@everyone | @user:<email> | @group:<name>")
+    gset.add_argument("--write", action="store_true",
+                      help="grant write (edit) rather than read (use)")
+    gcl = sgr2.add_parser("clear", help="revoke all access to a model")
+    gcl.add_argument("model")
+    gcl.add_argument("--yes", action="store_true", help="skip the prompt")
+    for sp_ in (gsh, gset, gcl):
+        sp_.set_defaults(fn=cmd_grants)
+
+    args = p.parse_args()
+    client = Client(args.url)
+    try:
+        load_token(client)
+        args.fn(client, args)
+    except ApiError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

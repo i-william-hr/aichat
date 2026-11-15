@@ -1,0 +1,17 @@
+monocle_apptrace==0.8.15
+open-webui==0.11.4
+
+# torch is deliberately the CPU-only build from the PyTorch CPU index, not the
+# default PyPI wheel. This host has no GPU (`torch.cuda.is_available()` is
+# False), and the default wheel drags in ~5.3 GB of NVIDIA CUDA libraries and
+# triton that can never run here. Reinstall with:
+#
+#   uv pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.14.0+cpu'
+#   uv pip uninstall nvidia-cublas nvidia-cuda-cupti nvidia-cuda-nvrtc \
+#       nvidia-cuda-runtime nvidia-cudnn-cu13 nvidia-cufft nvidia-cufile \
+#       nvidia-curand nvidia-cusolver nvidia-cusparse nvidia-cusparselt-cu13 \
+#       nvidia-nccl-cu13 nvidia-nvjitlink nvidia-nvshmem-cu13 nvidia-nvtx triton
+#
+# open-webui pulls torch in transitively via sentence-transformers and
+# accelerate, whose pins are lower bounds (torch>=1.11.0, torch>=2.0.0), so the
+# CPU build satisfies them and `uv pip check` stays clean.
